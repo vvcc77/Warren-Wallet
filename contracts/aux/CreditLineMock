@@ -1,0 +1,91 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+interface IWarrenWallet {
+    function positions(uint256 id) external view returns (
+        address asset,
+        address owner,
+        uint128 principalVault,
+        uint128 principalAave,
+        uint32  start,
+        uint32  unlockAt,
+        uint32  lastFeeAccruedAt,
+        bool    withdrawn
+    );
+}
+
+/// @title CreditLineMock
+/// @notice Módulo de crédito colateralizado de demostración (no transfiere fondos).
+///         Valida umbral mínimo y LTV, registra la línea y emite eventos.
+contract CreditLineMock {
+    IWarrenWallet public immutable vault;
+    uint256 public minThreshold;          // p.ej. 200 * 10^dec del asset (config off-chain por demo)
+    uint16  public maxLtvBps = 3000;      // 30% LTV
+    uint16  public interestYearBps = 500; // 5% anual fijo (demo)
+
+    struct Credit {
+        address borrower;
+        uint256 principal;
+        uint16  interestBps;
+        uint32  start;
+        bool    repaid;
+    }
+    mapping(uint256 => Credit) public creditByPosition;
+
+    event CreditOpened(uint256 indexed positionId, address indexed borrower, uint256 principal, uint16 interestBps);
+    event CreditRepaid(uint256 indexed positionId, address indexed borrower);
+
+    constructor(IWarrenWallet _vault, uint256 _minThreshold) {
+        vault = _vault;
+        minThreshold = _minThreshold;
+    }
+
+    function setParams(uint16 _maxLtvBps, uint16 _interestYearBps, uint256 _minThreshold) external {
+        // Simplificado sin auth para demo; en producción => AccessControl
+        require(_maxLtvBps <= 8000, "ltv too high");
+        maxLtvBps = _maxLtvBps;
+        interestYearBps = _interestYearBps;
+        minThreshold = _minThreshold;
+    }
+
+    function openCreditLine(uint256 positionId, uint256 amount) external {
+        (
+            address asset,
+            address owner,
+            uint128 principalVault,
+            uint128 principalAave,
+            ,
+            ,
+            ,
+            bool withdrawn
+        ) = vault.positions(positionId);
+
+        require(msg.sender == owner, "not owner");
+        require(!withdrawn, "withdrawn");
+
+        uint256 collateral = uint256(principalVault) + uint256(principalAave);
+        require(collateral >= minThreshold, "below threshold");
+
+        uint256 maxBorrow = collateral * maxLtvBps / 10_000;
+        require(amount <= maxBorrow, "exceeds LTV");
+
+        creditByPosition[positionId] = Credit({
+            borrower: owner,
+            principal: amount,
+            interestBps: interestYearBps,
+            start: uint32(block.timestamp),
+            repaid: false
+        });
+
+        emit CreditOpened(positionId, owner, amount, interestYearBps);
+        // Nota: no se transfieren fondos en demo
+    }
+
+    function repay(uint256 positionId) external {
+        Credit storage c = creditByPosition[positionId];
+        require(msg.sender == c.borrower, "not borrower");
+        require(!c.repaid, "already");
+        c.repaid = true;
+        emit CreditRepaid(positionId, msg.sender);
+    }
+}
